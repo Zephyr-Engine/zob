@@ -64,6 +64,33 @@ const ErrorJob = struct {
     }
 };
 
+const VoidJob = struct {
+    pub fn execute(self: @This()) void {
+        _ = self;
+    }
+};
+
+const U64Job = struct {
+    x: u64,
+
+    pub fn execute(self: @This()) u64 {
+        return self.x *% 6364136223846793005;
+    }
+};
+
+const MultiErrorJob = struct {
+    code: u8,
+
+    pub fn execute(self: @This()) error{ Alpha, Beta, Gamma }!u32 {
+        return switch (self.code) {
+            0 => error.Alpha,
+            1 => error.Beta,
+            2 => error.Gamma,
+            else => self.code * 10,
+        };
+    }
+};
+
 test "validateJobType accepts valid job" {
     validateJobType(ValidJob);
 }
@@ -72,9 +99,23 @@ test "validateJobType accepts job returning error union" {
     validateJobType(ErrorJob);
 }
 
+test "validateJobType accepts void return" {
+    validateJobType(VoidJob);
+}
+
+test "validateJobType accepts u64 return" {
+    validateJobType(U64Job);
+}
+
+test "validateJobType accepts multi-error return" {
+    validateJobType(MultiErrorJob);
+}
+
 test "JobResult extracts return type" {
     try testing.expect(JobResult(ValidJob) == i32);
     try testing.expect(JobResult(ErrorJob) == @TypeOf(@as(ErrorJob, undefined).execute()));
+    try testing.expect(JobResult(VoidJob) == void);
+    try testing.expect(JobResult(U64Job) == u64);
 }
 
 test "makeRunner produces callable function" {
@@ -89,4 +130,24 @@ test "makeRunner handles error union" {
     try testing.expectEqual(@as(i32, 42), ok);
     const err = runner(.{ .should_fail = true });
     try testing.expectError(error.JobFailed, err);
+}
+
+test "makeRunner handles void return" {
+    const runner = makeRunner(VoidJob);
+    runner(.{});
+}
+
+test "makeRunner handles u64" {
+    const runner = makeRunner(U64Job);
+    const result = runner(.{ .x = 1 });
+    try testing.expectEqual(@as(u64, 6364136223846793005), result);
+}
+
+test "makeRunner handles multi-error job" {
+    const runner = makeRunner(MultiErrorJob);
+    try testing.expectError(error.Alpha, runner(.{ .code = 0 }));
+    try testing.expectError(error.Beta, runner(.{ .code = 1 }));
+    try testing.expectError(error.Gamma, runner(.{ .code = 2 }));
+    const ok = try runner(.{ .code = 5 });
+    try testing.expectEqual(@as(u32, 50), ok);
 }
