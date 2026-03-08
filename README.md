@@ -11,7 +11,7 @@ Designed for the [Zephyr Game Engine](https://github.com/your-org/zephyr) but fu
 - **Zero-allocation hot path** — `submitInlineBatch()` and `submitBatchBuf()` avoid all heap allocations for game-loop-friendly performance.
 - **Future-based results** — `Future.await(io)` blocks the task (not the thread) until the result is ready.
 - **Error propagation** — if `execute` returns an error union, the error flows through the Future naturally.
-- **Priority levels** — high, normal, low (advisory in v0.1.0).
+- **Priority levels** — high, normal, low.
 - **Zero dependencies** — built entirely on `std.Io`, no custom thread pool or runtime.
 
 ## Requirements
