@@ -5,14 +5,45 @@ pub fn Future(comptime Result: type) type {
     return struct {
         const Self = @This();
 
-        inner: Io.Future(Result),
+        pub const Deferred = struct {
+            dispatch: *const fn (*Deferred, Io) Io.Future(Result),
+            execute: *const fn (*Deferred) Result,
+            destroy: *const fn (*Deferred, std.mem.Allocator) void,
+        };
+
+        state: union(enum) {
+            immediate: Io.Future(Result),
+            deferred: struct {
+                d: *Deferred,
+                allocator: std.mem.Allocator,
+            },
+        },
 
         pub fn await(self: *Self, io: Io) Result {
-            return self.inner.await(io);
+            switch (self.state) {
+                .deferred => |info| {
+                    const io_future = info.d.dispatch(info.d, io);
+                    info.d.destroy(info.d, info.allocator);
+                    self.state = .{ .immediate = io_future };
+                },
+                .immediate => {},
+            }
+            switch (self.state) {
+                .immediate => |*f| return f.await(io),
+                .deferred => unreachable,
+            }
         }
 
         pub fn cancel(self: *Self, io: Io) Result {
-            return self.inner.cancel(io);
+            switch (self.state) {
+                .deferred => |info| {
+                    // Run synchronously — skip thread pool entirely
+                    const result = info.d.execute(info.d);
+                    info.d.destroy(info.d, info.allocator);
+                    return result;
+                },
+                .immediate => |*f| return f.cancel(io),
+            }
         }
     };
 }
@@ -90,7 +121,7 @@ pub fn InlineBatchFuture(comptime Result: type, comptime capacity: usize) type {
     };
 }
 
-fn UnwrapErrorUnion(comptime T: type) type {
+pub fn UnwrapErrorUnion(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .error_union => |eu| eu.payload,
         else => T,
@@ -141,7 +172,7 @@ test "Future.await returns correct result" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var f: Future(i32) = .{ .inner = io.async(runner_double, .{DoubleJob{ .value = 7 }}) };
+    var f: Future(i32) = .{ .state = .{ .immediate = io.async(runner_double, .{DoubleJob{ .value = 7 }}) } };
     const result = f.await(io);
     try testing.expectEqual(@as(i32, 14), result);
 }
@@ -151,7 +182,7 @@ test "Future.cancel returns result" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var f: Future(i32) = .{ .inner = io.async(runner_double, .{DoubleJob{ .value = 5 }}) };
+    var f: Future(i32) = .{ .state = .{ .immediate = io.async(runner_double, .{DoubleJob{ .value = 5 }}) } };
     const result = f.cancel(io);
     try testing.expectEqual(@as(i32, 10), result);
 }
@@ -161,7 +192,7 @@ test "Future.await propagates error" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var f: Future(error{Boom}!i32) = .{ .inner = io.async(runner_fail, .{FailJob{ .should_fail = true }}) };
+    var f: Future(error{Boom}!i32) = .{ .state = .{ .immediate = io.async(runner_fail, .{FailJob{ .should_fail = true }}) } };
     try testing.expectError(error.Boom, f.await(io));
 }
 
@@ -170,7 +201,7 @@ test "Future.await returns success from fallible job" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    var f: Future(error{Boom}!i32) = .{ .inner = io.async(runner_fail, .{FailJob{ .should_fail = false }}) };
+    var f: Future(error{Boom}!i32) = .{ .state = .{ .immediate = io.async(runner_fail, .{FailJob{ .should_fail = false }}) } };
     const result = try f.await(io);
     try testing.expectEqual(@as(i32, 99), result);
 }
