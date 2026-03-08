@@ -21,6 +21,12 @@ pub const Scheduler = struct {
         };
     }
 
+    /// Dispatch a function call, preferring true concurrency when available.
+    /// Falls back to async if the Io implementation doesn't support concurrent.
+    fn dispatch(self: *Self, comptime func: anytype, args: anytype) Io.Future(@typeInfo(@TypeOf(@as(@TypeOf(func), func))).@"fn".return_type.?) {
+        return self.io.concurrent(func, args) catch self.io.async(func, args);
+    }
+
     /// Submit a single job for async execution.
     pub fn submit(
         self: *Self,
@@ -30,7 +36,7 @@ pub const Scheduler = struct {
     ) Future(job.JobResult(T)) {
         _ = priority;
         const runner = comptime job.makeRunner(T);
-        const handle = self.io.async(runner, .{data});
+        const handle = self.dispatch(runner, .{data});
         return .{ .inner = handle };
     }
 
@@ -48,7 +54,7 @@ pub const Scheduler = struct {
         var result: InlineBatchFuture(job.JobResult(T), N) = undefined;
         result.len = N;
         for (items, 0..) |item, i| {
-            result.futures[i] = self.io.async(runner, .{item});
+            result.futures[i] = self.dispatch(runner, .{item});
         }
         return result;
     }
@@ -66,7 +72,7 @@ pub const Scheduler = struct {
         const runner = comptime job.makeRunner(T);
         const len = @min(items.len, buf.len);
         for (items[0..len], 0..) |item, i| {
-            buf[i] = self.io.async(runner, .{item});
+            buf[i] = self.dispatch(runner, .{item});
         }
         return buf[0..len];
     }
@@ -87,7 +93,7 @@ pub const Scheduler = struct {
         errdefer self.allocator.free(futures);
 
         for (items, 0..) |item, i| {
-            futures[i] = self.io.async(runner, .{item});
+            futures[i] = self.dispatch(runner, .{item});
         }
 
         return .{ .futures = futures, .allocator = self.allocator };
@@ -463,4 +469,172 @@ test "submitBatchBuf truncates to buffer size" {
 
     try testing.expectEqual(@as(i32, 2), results[0]);
     try testing.expectEqual(@as(i32, 4), results[1]);
+}
+
+// --- concurrent dispatch tests ---
+
+const AtomicCounter = struct {
+    value: std.atomic.Value(u32),
+
+    fn init() AtomicCounter {
+        return .{ .value = std.atomic.Value(u32).init(0) };
+    }
+
+    fn increment(self: *AtomicCounter) void {
+        _ = self.value.fetchAdd(1, .monotonic);
+    }
+
+    fn load(self: *AtomicCounter) u32 {
+        return self.value.load(.monotonic);
+    }
+};
+
+var concurrent_counter: AtomicCounter = AtomicCounter.init();
+
+const CountingJob = struct {
+    pub fn execute(self: @This()) void {
+        _ = self;
+        concurrent_counter.increment();
+    }
+};
+
+test "dispatch uses concurrent with Io.Threaded" {
+    concurrent_counter = AtomicCounter.init();
+
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+
+    // Submit multiple jobs — with Io.Threaded, dispatch should use concurrent
+    var f1 = sched.submit(CountingJob, .{}, .normal);
+    var f2 = sched.submit(CountingJob, .{}, .normal);
+    var f3 = sched.submit(CountingJob, .{}, .normal);
+    var f4 = sched.submit(CountingJob, .{}, .normal);
+
+    f1.await(io);
+    f2.await(io);
+    f3.await(io);
+    f4.await(io);
+
+    // All 4 jobs completed — concurrent or async, result is the same
+    try testing.expectEqual(@as(u32, 4), concurrent_counter.load());
+}
+
+var concurrent_sum: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+
+const AtomicAddJob = struct {
+    value: i64,
+
+    pub fn execute(self: @This()) i64 {
+        _ = self.value;
+        _ = concurrent_sum.fetchAdd(self.value, .monotonic);
+        return self.value;
+    }
+};
+
+test "concurrent dispatch produces correct results across many jobs" {
+    concurrent_sum = std.atomic.Value(i64).init(0);
+
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+
+    const n = 64;
+    var items: [n]AtomicAddJob = undefined;
+    for (&items, 0..) |*item, i| {
+        item.* = .{ .value = @intCast(i + 1) };
+    }
+
+    var batch = try sched.submitBatch(AtomicAddJob, &items, .high);
+    defer batch.deinit();
+
+    const results = try batch.awaitAll(io);
+    defer testing.allocator.free(results);
+
+    // Each job returns its own value
+    for (results, 0..) |r, i| {
+        try testing.expectEqual(@as(i64, @intCast(i + 1)), r);
+    }
+
+    // Atomic sum should equal 1+2+...+64 = 2080
+    try testing.expectEqual(@as(i64, (n * (n + 1)) / 2), concurrent_sum.load(.monotonic));
+}
+
+test "concurrent dispatch with inline batch" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+    const items = [_]SquareJob{
+        .{ .value = 5 },
+        .{ .value = 6 },
+        .{ .value = 7 },
+        .{ .value = 8 },
+    };
+
+    var batch = sched.submitInlineBatch(SquareJob, 4, &items, .normal);
+    const results = batch.awaitAll(io);
+
+    try testing.expectEqual(@as(i32, 25), results[0]);
+    try testing.expectEqual(@as(i32, 36), results[1]);
+    try testing.expectEqual(@as(i32, 49), results[2]);
+    try testing.expectEqual(@as(i32, 64), results[3]);
+}
+
+test "concurrent dispatch with batchBuf" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+    const items = [_]AddJob{
+        .{ .a = 10, .b = 10 },
+        .{ .a = 20, .b = 20 },
+        .{ .a = 30, .b = 30 },
+    };
+
+    var buf: [3]Io.Future(i32) = undefined;
+    const futures = sched.submitBatchBuf(AddJob, &items, .high, &buf);
+
+    var results: [3]i32 = undefined;
+    for (futures, 0..) |*f, i| {
+        results[i] = f.await(io);
+    }
+
+    try testing.expectEqual(@as(i32, 20), results[0]);
+    try testing.expectEqual(@as(i32, 40), results[1]);
+    try testing.expectEqual(@as(i32, 60), results[2]);
+}
+
+test "concurrent dispatch error propagation" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+
+    // Success case
+    var f_ok = sched.submit(FailableJob, .{ .should_fail = false }, .high);
+    const ok_result = try f_ok.await(io);
+    try testing.expectEqual(@as(i32, 77), ok_result);
+
+    // Error case
+    var f_err = sched.submit(FailableJob, .{ .should_fail = true }, .high);
+    try testing.expectError(error.TestFail, f_err.await(io));
+}
+
+test "concurrent dispatch cancel" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var sched = Scheduler.init(io, testing.allocator);
+    var future = sched.submit(AddJob, .{ .a = 42, .b = 8 }, .normal);
+    const result = future.cancel(io);
+    try testing.expectEqual(@as(i32, 50), result);
 }
