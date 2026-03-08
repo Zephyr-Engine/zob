@@ -11,20 +11,36 @@ pub const InlineBatchFuture = future_mod.InlineBatchFuture;
 pub const Scheduler = struct {
     const Self = @This();
 
+    const ConcurrentSupport = enum(u8) { unknown, yes, no };
+
     io: Io,
     allocator: std.mem.Allocator,
+    concurrent_support: ConcurrentSupport,
 
     pub fn init(io: Io, allocator: std.mem.Allocator) Self {
         return .{
             .io = io,
             .allocator = allocator,
+            .concurrent_support = .unknown,
         };
     }
 
     /// Dispatch a function call, preferring true concurrency when available.
-    /// Falls back to async if the Io implementation doesn't support concurrent.
+    /// Probes on first call and caches the result — zero overhead after init.
     fn dispatch(self: *Self, comptime func: anytype, args: anytype) Io.Future(@typeInfo(@TypeOf(@as(@TypeOf(func), func))).@"fn".return_type.?) {
-        return self.io.concurrent(func, args) catch self.io.async(func, args);
+        return switch (self.concurrent_support) {
+            .yes => self.io.concurrent(func, args) catch unreachable,
+            .no => self.io.async(func, args),
+            .unknown => {
+                if (self.io.concurrent(func, args)) |future| {
+                    self.concurrent_support = .yes;
+                    return future;
+                } else |_| {
+                    self.concurrent_support = .no;
+                    return self.io.async(func, args);
+                }
+            },
+        };
     }
 
     /// Submit a single job for async execution.
