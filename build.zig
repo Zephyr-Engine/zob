@@ -34,4 +34,24 @@ pub fn build(b: *std.Build) void {
     const run_example = b.addRunArtifact(example);
     run_example.step.dependOn(b.getInstallStep());
     example_step.dependOn(&run_example.step);
+
+    // Benchmark executable (always ReleaseFast for accurate measurements)
+    const benchmark = b.addExecutable(.{
+        .name = "zob-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/benchmark.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zob", .module = mod },
+            },
+        }),
+    });
+
+    const bench_step = b.step("bench", "Run performance benchmarks");
+    const run_bench = b.addRunArtifact(benchmark);
+    if (b.args) |args| {
+        run_bench.addArgs(args);
+    }
+    bench_step.dependOn(&run_bench.step);
 }

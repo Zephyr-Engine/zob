@@ -8,6 +8,7 @@ Designed for the [Zephyr Game Engine](https://github.com/your-org/zephyr) but fu
 
 - **Comptime job validation** — jobs are plain structs with `pub fn execute`. Invalid types produce clear compile errors.
 - **Single and batch submission** — `submit()` for one job, `submitBatch()` for many of the same type.
+- **Zero-allocation hot path** — `submitInlineBatch()` and `submitBatchBuf()` avoid all heap allocations for game-loop-friendly performance.
 - **Future-based results** — `Future.await(io)` blocks the task (not the thread) until the result is ready.
 - **Error propagation** — if `execute` returns an error union, the error flows through the Future naturally.
 - **Priority levels** — high, normal, low (advisory in v0.1.0).
@@ -152,4 +153,108 @@ var future = scheduler.submit(SomeJob, .{...}, .low);
 _ = future.cancel(io); // request cancellation and wait for completion
 ```
 
+### Zero-allocation batches
+
+For performance-critical code (game loops, real-time systems), use the zero-allocation APIs to avoid touching the heap entirely:
+
+**Comptime-known batch size — `submitInlineBatch`:**
+
+Everything lives on the stack. No allocator needed.
+
+```zig
+const jobs = [_]PhysicsJob{
+    .{ .body_id = 0 },
+    .{ .body_id = 1 },
+    .{ .body_id = 2 },
+    .{ .body_id = 3 },
+};
+
+// Zero heap allocations — futures are inline in the returned struct
+var batch = scheduler.submitInlineBatch(PhysicsJob, 4, &jobs, .high);
+
+// awaitAll returns a stack-allocated [4]Result — also zero allocations
+const results = batch.awaitAll(io);
+```
+
+**Runtime-sized batch with caller-provided buffer — `submitBatchBuf`:**
+
+```zig
+var future_buf: [64]std.Io.Future(u64) = undefined;
+const futures = scheduler.submitBatchBuf(ComputeJob, items, .normal, &future_buf);
+
+var result_buf: [64]u64 = undefined;
+for (futures, 0..) |*f, i| {
+    result_buf[i] = f.await(io);
+}
+```
+
+**Results into a caller buffer — `awaitAllBuf`:**
+
+```zig
+var batch = try scheduler.submitBatch(MyJob, items, .normal);
+defer batch.deinit();
+
+var result_buf: [128]i64 = undefined;
+const results = batch.awaitAllBuf(io, &result_buf); // no allocation for results
+```
+
+### API summary
+
+| Method | Futures alloc | Results alloc | Best for |
+|--------|:---:|:---:|------|
+| `submitBatch` + `awaitAll` | heap | heap | Dynamic sizes, convenience |
+| `submitBatch` + `awaitAllBuf` | heap | none | Dynamic batch, known max results |
+| `submitInlineBatch` + `awaitAll` | none | none | Comptime-known batch size (fastest) |
+| `submitBatchBuf` | none | manual | Full control, zero-alloc hot path |
+
+## Benchmarks
+
+Run the built-in benchmark suite:
+
+```sh
+zig build bench
+```
+
+### Configuration
+
+All parameters are optional:
+
+```sh
+zig build bench -- [options]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--scale=N` | 1 | Batch size multiplier |
+| `--work=N` | 100 | Loop iterations per job (controls job weight) |
+| `--iters=N` | 20 | Measured samples per benchmark |
+| `--warmup=N` | 5 | Warmup iterations before measuring |
+
+### Scale presets
+
+| Scale | Batch sizes | Use case |
+|-------|------------|----------|
+| 1 | 16 – 512 | Quick sanity check |
+| 4 | 64 – 2048 | Moderate stress |
+| 16 | 256 – 8192 | Heavy stress test |
+| 64 | 1024 – 32768 | Extreme load |
+
+### Examples
+
+```sh
+zig build bench                              # defaults
+zig build bench -- --scale=4                 # 4x batch sizes
+zig build bench -- --scale=16 --work=1000    # heavy stress, ~10us/job
+zig build bench -- --scale=64 --iters=50     # extreme, more samples
+zig build bench -- --work=10000              # very heavy jobs (~100us each)
+```
+
+### What it measures
+
+- **Single job overhead** — round-trip cost of `submit` + `await` for a no-op
+- **Batch scaling** — how per-op cost changes from 16 to 512+ jobs
+- **Dependency chains** — sequential job-to-job latency
+- **Fan-out / fan-in** — parallel scatter-gather pattern
+- **Game frame simulation** — mixed-priority batches (physics + AI + audio)
+- **Sustained throughput** — 10 consecutive waves of batches
 
