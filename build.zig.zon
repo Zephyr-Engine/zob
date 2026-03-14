@@ -1,6 +1,6 @@
 .{
     .name = .zob,
-    .version = "1.0.0",
+    .version = "1.1.0",
     .fingerprint = 0xe7fe4388c8a386a9,
     .minimum_zig_version = "0.16.0-dev.2694+74f361a5c",
     .dependencies = .{},
