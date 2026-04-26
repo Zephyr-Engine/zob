@@ -22,7 +22,7 @@ Designed for the [Zephyr Game Engine](https://github.com/your-org/zephyr) but fu
 Add zob as a dependency in your `build.zig.zon`:
 
 ```zig
-zig fetch --save git+https://github.com:Zephyr-Engine/zob.git
+zig fetch --save git+https://github.com:Zephyr-Engine/zob
 ```
 
 Then in your `build.zig`:
