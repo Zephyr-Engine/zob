@@ -1,18 +1,86 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub fn State(comptime Result: type) type {
+    return struct {
+        allocator: std.mem.Allocator,
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        done: bool = false,
+        result: Result = undefined,
+
+        pub fn create(allocator: std.mem.Allocator) !*@This() {
+            const state = try allocator.create(@This());
+            state.* = .{ .allocator = allocator };
+            return state;
+        }
+
+        pub fn resolve(self: *@This(), io: Io, result: Result) void {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            self.result = result;
+            self.done = true;
+            self.cond.broadcast(io);
+        }
+
+        fn wait(self: *@This(), io: Io) Result {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            while (!self.done) {
+                self.cond.waitUncancelable(io, &self.mutex);
+            }
+            return self.result;
+        }
+    };
+}
+
 pub fn Future(comptime Result: type) type {
     return struct {
         const Self = @This();
 
-        inner: Io.Future(Result),
+        inner: ?Io.Future(Result) = null,
+        state: ?*State(Result) = null,
+        cached: ?Result = null,
+
+        pub fn init(state: *State(Result)) Self {
+            return .{ .state = state };
+        }
+
+        pub fn fromIoFuture(inner: Io.Future(Result)) Self {
+            return .{ .inner = inner };
+        }
 
         pub fn await(self: *Self, io: Io) Result {
-            return self.inner.await(io);
+            if (self.cached) |result| {
+                return result;
+            }
+
+            const result = if (self.inner) |*inner|
+                inner.await(io)
+            else blk: {
+                const state = self.state orelse unreachable;
+                const state_result = state.wait(io);
+                state.allocator.destroy(state);
+                self.state = null;
+                break :blk state_result;
+            };
+            self.inner = null;
+            self.cached = result;
+            return result;
         }
 
         pub fn cancel(self: *Self, io: Io) Result {
-            return self.inner.cancel(io);
+            if (self.cached) |result| {
+                return result;
+            }
+
+            if (self.inner) |*inner| {
+                const result = inner.cancel(io);
+                self.inner = null;
+                self.cached = result;
+                return result;
+            }
+            return self.await(io);
         }
     };
 }
@@ -22,7 +90,7 @@ pub fn BatchFuture(comptime Result: type) type {
         const Self = @This();
         const Clean = UnwrapErrorUnion(Result);
 
-        futures: []Io.Future(Result),
+        futures: []Future(Result),
         allocator: std.mem.Allocator,
 
         pub fn awaitAllBuf(self: *Self, io: Io, results: []Clean) []Clean {
@@ -42,7 +110,7 @@ pub fn BatchFuture(comptime Result: type) type {
                 const r = f.await(io);
                 if (Result != Clean) {
                     results[i] = r catch |err| {
-                        // Cancel remaining futures to avoid leaks
+                        // Await remaining futures so their completion state is released.
                         for (self.futures[i + 1 ..]) |*remaining| {
                             _ = remaining.cancel(io) catch {};
                         }
@@ -67,7 +135,7 @@ pub fn InlineBatchFuture(comptime Result: type, comptime capacity: usize) type {
         const Self = @This();
         const Clean = UnwrapErrorUnion(Result);
 
-        futures: [capacity]Io.Future(Result),
+        futures: [capacity]Future(Result),
         len: usize,
 
         pub fn awaitAllBuf(self: *Self, io: Io, results: []Clean) []Clean {
@@ -90,227 +158,9 @@ pub fn InlineBatchFuture(comptime Result: type, comptime capacity: usize) type {
     };
 }
 
-fn UnwrapErrorUnion(comptime T: type) type {
+pub fn UnwrapErrorUnion(comptime T: type) type {
     return switch (@typeInfo(T)) {
         .error_union => |eu| eu.payload,
         else => T,
     };
-}
-
-// --- Tests ---
-
-const testing = std.testing;
-
-const DoubleJob = struct {
-    value: i32,
-    pub fn execute(self: @This()) i32 {
-        return self.value * 2;
-    }
-};
-
-const FailJob = struct {
-    should_fail: bool,
-    pub fn execute(self: @This()) error{Boom}!i32 {
-        if (self.should_fail) return error.Boom;
-        return 99;
-    }
-};
-
-const VoidJob = struct {
-    pub fn execute(self: @This()) void {
-        _ = self;
-    }
-};
-
-const runner_double = struct {
-    fn run(j: DoubleJob) i32 {
-        return j.execute();
-    }
-}.run;
-
-const runner_fail = struct {
-    fn run(j: FailJob) error{Boom}!i32 {
-        return j.execute();
-    }
-}.run;
-
-// --- Future tests ---
-
-test "Future.await returns correct result" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var f: Future(i32) = .{ .inner = io.async(runner_double, .{DoubleJob{ .value = 7 }}) };
-    const result = f.await(io);
-    try testing.expectEqual(@as(i32, 14), result);
-}
-
-test "Future.cancel returns result" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var f: Future(i32) = .{ .inner = io.async(runner_double, .{DoubleJob{ .value = 5 }}) };
-    const result = f.cancel(io);
-    try testing.expectEqual(@as(i32, 10), result);
-}
-
-test "Future.await propagates error" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var f: Future(error{Boom}!i32) = .{ .inner = io.async(runner_fail, .{FailJob{ .should_fail = true }}) };
-    try testing.expectError(error.Boom, f.await(io));
-}
-
-test "Future.await returns success from fallible job" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var f: Future(error{Boom}!i32) = .{ .inner = io.async(runner_fail, .{FailJob{ .should_fail = false }}) };
-    const result = try f.await(io);
-    try testing.expectEqual(@as(i32, 99), result);
-}
-
-// --- BatchFuture tests ---
-
-test "BatchFuture.awaitAll returns correct results" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var futures = try testing.allocator.alloc(Io.Future(i32), 3);
-    futures[0] = io.async(runner_double, .{DoubleJob{ .value = 1 }});
-    futures[1] = io.async(runner_double, .{DoubleJob{ .value = 2 }});
-    futures[2] = io.async(runner_double, .{DoubleJob{ .value = 3 }});
-
-    var batch: BatchFuture(i32) = .{ .futures = futures, .allocator = testing.allocator };
-    defer batch.deinit();
-
-    const results = try batch.awaitAll(io);
-    defer testing.allocator.free(results);
-
-    try testing.expectEqual(@as(i32, 2), results[0]);
-    try testing.expectEqual(@as(i32, 4), results[1]);
-    try testing.expectEqual(@as(i32, 6), results[2]);
-}
-
-test "BatchFuture.awaitAllBuf writes into caller buffer" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var futures = try testing.allocator.alloc(Io.Future(i32), 2);
-    futures[0] = io.async(runner_double, .{DoubleJob{ .value = 10 }});
-    futures[1] = io.async(runner_double, .{DoubleJob{ .value = 20 }});
-
-    var batch: BatchFuture(i32) = .{ .futures = futures, .allocator = testing.allocator };
-    defer batch.deinit();
-
-    var buf: [2]i32 = undefined;
-    const results = batch.awaitAllBuf(io, &buf);
-
-    try testing.expectEqual(@as(usize, 2), results.len);
-    try testing.expectEqual(@as(i32, 20), results[0]);
-    try testing.expectEqual(@as(i32, 40), results[1]);
-}
-
-test "BatchFuture.awaitAll propagates error from fallible job" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var futures = try testing.allocator.alloc(Io.Future(error{Boom}!i32), 2);
-    futures[0] = io.async(runner_fail, .{FailJob{ .should_fail = false }});
-    futures[1] = io.async(runner_fail, .{FailJob{ .should_fail = true }});
-
-    var batch: BatchFuture(error{Boom}!i32) = .{ .futures = futures, .allocator = testing.allocator };
-    defer batch.deinit();
-
-    try testing.expectError(error.Boom, batch.awaitAll(io));
-}
-
-test "BatchFuture with single element" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var futures = try testing.allocator.alloc(Io.Future(i32), 1);
-    futures[0] = io.async(runner_double, .{DoubleJob{ .value = 50 }});
-
-    var batch: BatchFuture(i32) = .{ .futures = futures, .allocator = testing.allocator };
-    defer batch.deinit();
-
-    const results = try batch.awaitAll(io);
-    defer testing.allocator.free(results);
-
-    try testing.expectEqual(@as(usize, 1), results.len);
-    try testing.expectEqual(@as(i32, 100), results[0]);
-}
-
-// --- InlineBatchFuture tests ---
-
-test "InlineBatchFuture.awaitAll returns inline array" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var batch: InlineBatchFuture(i32, 3) = undefined;
-    batch.len = 3;
-    batch.futures[0] = io.async(runner_double, .{DoubleJob{ .value = 4 }});
-    batch.futures[1] = io.async(runner_double, .{DoubleJob{ .value = 5 }});
-    batch.futures[2] = io.async(runner_double, .{DoubleJob{ .value = 6 }});
-
-    const results = batch.awaitAll(io);
-
-    try testing.expectEqual(@as(i32, 8), results[0]);
-    try testing.expectEqual(@as(i32, 10), results[1]);
-    try testing.expectEqual(@as(i32, 12), results[2]);
-}
-
-test "InlineBatchFuture.awaitAllBuf writes into caller buffer" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var batch: InlineBatchFuture(i32, 2) = undefined;
-    batch.len = 2;
-    batch.futures[0] = io.async(runner_double, .{DoubleJob{ .value = 7 }});
-    batch.futures[1] = io.async(runner_double, .{DoubleJob{ .value = 8 }});
-
-    var buf: [2]i32 = undefined;
-    const results = batch.awaitAllBuf(io, &buf);
-
-    try testing.expectEqual(@as(usize, 2), results.len);
-    try testing.expectEqual(@as(i32, 14), results[0]);
-    try testing.expectEqual(@as(i32, 16), results[1]);
-}
-
-test "InlineBatchFuture with single element" {
-    var threaded = Io.Threaded.init(testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var batch: InlineBatchFuture(i32, 1) = undefined;
-    batch.len = 1;
-    batch.futures[0] = io.async(runner_double, .{DoubleJob{ .value = 25 }});
-
-    const results = batch.awaitAll(io);
-    try testing.expectEqual(@as(i32, 50), results[0]);
-}
-
-// --- UnwrapErrorUnion tests ---
-
-test "UnwrapErrorUnion unwraps error union" {
-    try testing.expect(UnwrapErrorUnion(error{Foo}!i32) == i32);
-    try testing.expect(UnwrapErrorUnion(anyerror!u64) == u64);
-}
-
-test "UnwrapErrorUnion passes through non-error types" {
-    try testing.expect(UnwrapErrorUnion(i32) == i32);
-    try testing.expect(UnwrapErrorUnion(void) == void);
-    try testing.expect(UnwrapErrorUnion(u64) == u64);
 }

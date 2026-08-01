@@ -11,53 +11,92 @@ pub const InlineBatchFuture = future_mod.InlineBatchFuture;
 pub const Scheduler = struct {
     const Self = @This();
 
-    const ConcurrentSupport = enum(u8) { unknown, yes, no };
+    pub const Options = struct {
+        max_concurrency: usize = 0,
+    };
+
+    const QueuedJob = struct {
+        priority: Priority,
+        context: *anyopaque,
+        run: *const fn (*anyopaque) void,
+    };
 
     io: Io,
     allocator: std.mem.Allocator,
-    concurrent_support: ConcurrentSupport,
+    max_concurrency: usize,
+    mutex: Io.Mutex = .init,
+    group: Io.Group = .init,
+    queued: std.ArrayList(QueuedJob) = .empty,
+    active: usize = 0,
+    dispatching: bool = false,
 
     pub fn init(io: Io, allocator: std.mem.Allocator) Self {
+        return initWithOptions(io, allocator, .{});
+    }
+
+    pub fn initWithOptions(io: Io, allocator: std.mem.Allocator, options: Options) Self {
         return .{
             .io = io,
             .allocator = allocator,
-            .concurrent_support = .unknown,
+            .max_concurrency = if (options.max_concurrency == 0) std.math.maxInt(usize) else options.max_concurrency,
         };
     }
 
-    /// Dispatch a function call, preferring true concurrency when available.
-    /// Probes on first call and caches the result — zero overhead after init.
-    fn dispatch(self: *Self, comptime func: anytype, args: anytype) Io.Future(@typeInfo(@TypeOf(@as(@TypeOf(func), func))).@"fn".return_type.?) {
-        return switch (self.concurrent_support) {
-            .yes => self.io.concurrent(func, args) catch unreachable,
-            .no => self.io.async(func, args),
-            .unknown => {
-                if (self.io.concurrent(func, args)) |future| {
-                    self.concurrent_support = .yes;
-                    return future;
-                } else |_| {
-                    self.concurrent_support = .no;
-                    return self.io.async(func, args);
-                }
-            },
-        };
+    /// Waits for running work to finish and frees the scheduler's queue.
+    /// All returned futures must be awaited or cancelled before this call.
+    pub fn deinit(self: *Self) void {
+        self.group.await(self.io) catch unreachable;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        std.debug.assert(self.queued.items.len == 0);
+        std.debug.assert(self.active == 0);
+        self.queued.deinit(self.allocator);
     }
 
-    /// Submit a single job for async execution.
+    /// Submit a single job. Higher-priority pending jobs start first; jobs
+    /// already running are never preempted.
     pub fn submit(
         self: *Self,
         comptime T: type,
         data: T,
         priority: Priority,
     ) Future(job.JobResult(T)) {
-        _ = priority;
-        const runner = comptime job.makeRunner(T);
-        const handle = self.dispatch(runner, .{data});
-        return .{ .inner = handle };
+        return self.trySubmit(T, data, priority) catch @panic("zob scheduler out of memory");
     }
 
-    /// Submit a batch with a comptime-known size. Zero heap allocations.
-    /// This is the fastest path for fixed-size batches.
+    pub fn trySubmit(
+        self: *Self,
+        comptime T: type,
+        data: T,
+        priority: Priority,
+    ) !Future(job.JobResult(T)) {
+        if (self.max_concurrency == std.math.maxInt(usize)) {
+            const runner = comptime job.makeRunner(T);
+            return Future(job.JobResult(T)).fromIoFuture(self.dispatchDirect(runner, .{data}));
+        }
+
+        const Result = job.JobResult(T);
+        const completion = try future_mod.State(Result).create(self.allocator);
+        errdefer self.allocator.destroy(completion);
+
+        const state = try self.allocator.create(JobState(T));
+        errdefer self.allocator.destroy(state);
+        state.* = .{
+            .scheduler = self,
+            .completion = completion,
+            .data = data,
+        };
+
+        try self.enqueue(.{
+            .priority = priority,
+            .context = state,
+            .run = JobState(T).run,
+        });
+        return Future(Result).init(completion);
+    }
+
+    /// Submit a batch with a comptime-known size. This avoids allocating the
+    /// futures buffer; bounded schedulers still allocate queued-job state.
     pub fn submitInlineBatch(
         self: *Self,
         comptime T: type,
@@ -65,54 +104,143 @@ pub const Scheduler = struct {
         items: *const [N]T,
         priority: Priority,
     ) InlineBatchFuture(job.JobResult(T), N) {
-        _ = priority;
-        const runner = comptime job.makeRunner(T);
         var result: InlineBatchFuture(job.JobResult(T), N) = undefined;
         result.len = N;
         for (items, 0..) |item, i| {
-            result.futures[i] = self.dispatch(runner, .{item});
+            result.futures[i] = self.submit(T, item, priority);
         }
         return result;
     }
 
-    /// Submit a batch into a caller-provided futures buffer. Zero heap allocations.
-    /// Buffer must be at least items.len. Returns the used portion.
+    /// Submit a batch into a caller-provided futures buffer. This avoids
+    /// allocating the futures buffer; bounded schedulers still allocate queued-job state.
     pub fn submitBatchBuf(
         self: *Self,
         comptime T: type,
         items: []const T,
         priority: Priority,
-        buf: []Io.Future(job.JobResult(T)),
-    ) []Io.Future(job.JobResult(T)) {
-        _ = priority;
-        const runner = comptime job.makeRunner(T);
+        buf: []Future(job.JobResult(T)),
+    ) []Future(job.JobResult(T)) {
         const len = @min(items.len, buf.len);
         for (items[0..len], 0..) |item, i| {
-            buf[i] = self.dispatch(runner, .{item});
+            buf[i] = self.submit(T, item, priority);
         }
         return buf[0..len];
     }
 
-    /// Submit a batch, heap-allocating the futures slice.
-    /// For zero-alloc alternatives, use submitInlineBatch or submitBatchBuf.
+    /// Submit a batch, heap-allocating the futures slice. Caller-provided or
+    /// inline futures buffers avoid this slice allocation.
     pub fn submitBatch(
         self: *Self,
         comptime T: type,
         items: []const T,
         priority: Priority,
     ) !BatchFuture(job.JobResult(T)) {
-        _ = priority;
         const Result = job.JobResult(T);
-        const runner = comptime job.makeRunner(T);
 
-        var futures = try self.allocator.alloc(Io.Future(Result), items.len);
-        errdefer self.allocator.free(futures);
+        var futures = try self.allocator.alloc(Future(Result), items.len);
+        var submitted: usize = 0;
+        errdefer {
+            for (futures[0..submitted]) |*future| {
+                if (comptime @typeInfo(Result) == .error_union) {
+                    _ = future.cancel(self.io) catch {};
+                } else {
+                    _ = future.cancel(self.io);
+                }
+            }
+            self.allocator.free(futures);
+        }
 
         for (items, 0..) |item, i| {
-            futures[i] = self.dispatch(runner, .{item});
+            futures[i] = try self.trySubmit(T, item, priority);
+            submitted += 1;
         }
 
         return .{ .futures = futures, .allocator = self.allocator };
+    }
+
+    fn JobState(comptime T: type) type {
+        const Result = job.JobResult(T);
+        return struct {
+            scheduler: *Scheduler,
+            completion: *future_mod.State(Result),
+            data: T,
+
+            fn run(context: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(context));
+                const scheduler = self.scheduler;
+                const result = self.data.execute();
+                self.completion.resolve(scheduler.io, result);
+                scheduler.allocator.destroy(self);
+                scheduler.finishJob();
+            }
+        };
+    }
+
+    fn enqueue(self: *Self, queued_job: QueuedJob) !void {
+        self.mutex.lockUncancelable(self.io);
+        errdefer self.mutex.unlock(self.io);
+        try self.queued.append(self.allocator, queued_job);
+        self.mutex.unlock(self.io);
+        self.kick();
+    }
+
+    fn finishJob(self: *Self) void {
+        self.mutex.lockUncancelable(self.io);
+        self.active -= 1;
+        self.mutex.unlock(self.io);
+        self.kick();
+    }
+
+    fn kick(self: *Self) void {
+        self.mutex.lockUncancelable(self.io);
+        if (self.dispatching) {
+            self.mutex.unlock(self.io);
+            return;
+        }
+        self.dispatching = true;
+        self.mutex.unlock(self.io);
+
+        while (true) {
+            self.mutex.lockUncancelable(self.io);
+            if (self.active == self.max_concurrency or self.queued.items.len == 0) {
+                self.dispatching = false;
+                self.mutex.unlock(self.io);
+                return;
+            }
+            const next = self.takeHighestPriorityLocked();
+            self.active += 1;
+            self.mutex.unlock(self.io);
+
+            self.dispatch(next);
+        }
+    }
+
+    fn takeHighestPriorityLocked(self: *Self) QueuedJob {
+        var best_index: usize = 0;
+        for (self.queued.items[1..], 1..) |queued_job, index| {
+            if (@intFromEnum(queued_job.priority) < @intFromEnum(self.queued.items[best_index].priority)) {
+                best_index = index;
+            }
+        }
+        return self.queued.orderedRemove(best_index);
+    }
+
+    fn dispatch(self: *Self, queued_job: QueuedJob) void {
+        self.group.concurrent(self.io, runQueuedJob, .{queued_job}) catch {
+            self.group.async(self.io, runQueuedJob, .{queued_job});
+        };
+    }
+
+    /// `Io.concurrent` can be temporarily unavailable even after earlier
+    /// successes. Fall back for this submission rather than assuming that
+    /// concurrency support is permanent.
+    fn dispatchDirect(self: *Self, comptime func: anytype, args: anytype) Io.Future(@typeInfo(@TypeOf(@as(@TypeOf(func), func))).@"fn".return_type.?) {
+        return self.io.concurrent(func, args) catch self.io.async(func, args);
+    }
+
+    fn runQueuedJob(queued_job: QueuedJob) Io.Cancelable!void {
+        queued_job.run(queued_job.context);
     }
 };
 
@@ -447,7 +575,7 @@ test "submitBatchBuf zero-alloc" {
         .{ .a = 3, .b = 4 },
     };
 
-    var buf: [2]Io.Future(i32) = undefined;
+    var buf: [2]Future(i32) = undefined;
     const futures = sched.submitBatchBuf(AddJob, &items, .normal, &buf);
 
     var results: [2]i32 = undefined;
@@ -473,7 +601,7 @@ test "submitBatchBuf truncates to buffer size" {
     };
 
     // Buffer smaller than items — should only process 2
-    var buf: [2]Io.Future(i32) = undefined;
+    var buf: [2]Future(i32) = undefined;
     const futures = sched.submitBatchBuf(AddJob, &items, .normal, &buf);
 
     try testing.expectEqual(@as(usize, 2), futures.len);
@@ -614,7 +742,7 @@ test "concurrent dispatch with batchBuf" {
         .{ .a = 30, .b = 30 },
     };
 
-    var buf: [3]Io.Future(i32) = undefined;
+    var buf: [3]Future(i32) = undefined;
     const futures = sched.submitBatchBuf(AddJob, &items, .high, &buf);
 
     var results: [3]i32 = undefined;
@@ -653,4 +781,116 @@ test "concurrent dispatch cancel" {
     var future = sched.submit(AddJob, .{ .a = 42, .b = 8 }, .normal);
     const result = future.cancel(io);
     try testing.expectEqual(@as(i32, 50), result);
+}
+
+const OrderedContext = struct {
+    io: Io,
+    gate: Io.Semaphore = .{},
+    started: Io.Semaphore = .{},
+    mutex: Io.Mutex = .init,
+    order: [3]u8 = undefined,
+    len: usize = 0,
+
+    fn append(self: *OrderedContext, value: u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.order[self.len] = value;
+        self.len += 1;
+    }
+};
+
+const OrderedJob = struct {
+    context: *OrderedContext,
+    value: u8,
+    blocks: bool = false,
+
+    pub fn execute(self: @This()) void {
+        self.context.append(self.value);
+        if (self.blocks) {
+            self.context.started.post(self.context.io);
+            self.context.gate.waitUncancelable(self.context.io);
+        }
+    }
+};
+
+test "bounded scheduler starts pending jobs by priority" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var scheduler = Scheduler.initWithOptions(io, testing.allocator, .{ .max_concurrency = 1 });
+    defer scheduler.deinit();
+    var context = OrderedContext{ .io = io };
+
+    var first = scheduler.submit(OrderedJob, .{ .context = &context, .value = 1, .blocks = true }, .low);
+    context.started.waitUncancelable(io);
+    var normal = scheduler.submit(OrderedJob, .{ .context = &context, .value = 2 }, .normal);
+    var high = scheduler.submit(OrderedJob, .{ .context = &context, .value = 3 }, .high);
+
+    context.gate.post(io);
+    first.await(io);
+    high.await(io);
+    normal.await(io);
+
+    try testing.expectEqualSlices(u8, &.{ 1, 3, 2 }, context.order[0..context.len]);
+}
+
+const ConcurrencyContext = struct {
+    io: Io,
+    release: Io.Semaphore = .{},
+    started: Io.Semaphore = .{},
+    mutex: Io.Mutex = .init,
+    active: usize = 0,
+    peak: usize = 0,
+
+    fn begin(self: *ConcurrencyContext) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.active += 1;
+        self.peak = @max(self.peak, self.active);
+    }
+
+    fn end(self: *ConcurrencyContext) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.active -= 1;
+    }
+};
+
+const LimitedJob = struct {
+    context: *ConcurrencyContext,
+
+    pub fn execute(self: @This()) void {
+        self.context.begin();
+        self.context.started.post(self.context.io);
+        self.context.release.waitUncancelable(self.context.io);
+        self.context.end();
+    }
+};
+
+test "bounded scheduler limits concurrent job bodies" {
+    var threaded = Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var scheduler = Scheduler.initWithOptions(io, testing.allocator, .{ .max_concurrency = 2 });
+    defer scheduler.deinit();
+    var context = ConcurrencyContext{ .io = io };
+
+    var first = scheduler.submit(LimitedJob, .{ .context = &context }, .normal);
+    var second = scheduler.submit(LimitedJob, .{ .context = &context }, .normal);
+    var third = scheduler.submit(LimitedJob, .{ .context = &context }, .normal);
+
+    context.started.waitUncancelable(io);
+    context.started.waitUncancelable(io);
+    try testing.expectEqual(@as(usize, 2), context.peak);
+
+    context.release.post(io);
+    context.release.post(io);
+    context.release.post(io);
+    first.await(io);
+    second.await(io);
+    third.await(io);
+
+    try testing.expectEqual(@as(usize, 2), context.peak);
 }
