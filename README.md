@@ -8,10 +8,10 @@ Designed for the [Zephyr Game Engine](https://github.com/your-org/zephyr) but fu
 
 - **Comptime job validation** — jobs are plain structs with `pub fn execute`. Invalid types produce clear compile errors.
 - **Single and batch submission** — `submit()` for one job, `submitBatch()` for many of the same type.
-- **Zero-allocation hot path** — `submitInlineBatch()` and `submitBatchBuf()` avoid all heap allocations for game-loop-friendly performance.
+- **Zero-allocation direct path** — default `submit*` calls delegate directly to `std.Io`; caller-provided and inline futures buffers also avoid a futures-slice allocation.
 - **Future-based results** — `Future.await(io)` blocks the task (not the thread) until the result is ready.
 - **Error propagation** — if `execute` returns an error union, the error flows through the Future naturally.
-- **Priority levels** — high, normal, low.
+- **Priority levels** — high, normal, low for bounded schedulers.
 - **Zero dependencies** — built entirely on `std.Io`, no custom thread pool or runtime.
 
 ## Requirements
@@ -97,6 +97,19 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
+### Bounded concurrency and priority
+
+The default scheduler dispatches directly to `std.Io` for the lowest possible
+submission overhead. Set `max_concurrency` when work must be bounded; pending
+jobs then start in priority order. Running jobs are not preempted.
+
+```zig
+var scheduler = zob.Scheduler.initWithOptions(io, allocator, .{
+    .max_concurrency = 4,
+});
+defer scheduler.deinit();
+```
+
 ### Submitting a single job
 
 ```zig
@@ -150,16 +163,20 @@ if (future.await(io)) |val| {
 
 ```zig
 var future = scheduler.submit(SomeJob, .{...}, .low);
-_ = future.cancel(io); // request cancellation and wait for completion
+_ = future.cancel(io); // request cancellation for a direct job, then wait
 ```
 
-### Zero-allocation batches
+### Allocation-aware batches
 
-For performance-critical code (game loops, real-time systems), use the zero-allocation APIs to avoid touching the heap entirely:
+For performance-critical code, use caller-provided or inline futures buffers
+to avoid allocating the futures slice. The default scheduler dispatches these
+jobs without heap allocation; bounded schedulers allocate state for pending jobs.
 
 **Comptime-known batch size — `submitInlineBatch`:**
 
-Everything lives on the stack. No allocator needed.
+The futures buffer lives on the stack. With the default unbounded scheduler,
+submission performs no heap allocations; bounded schedulers allocate state for
+jobs waiting in the priority queue.
 
 ```zig
 const jobs = [_]PhysicsJob{
@@ -169,7 +186,7 @@ const jobs = [_]PhysicsJob{
     .{ .body_id = 3 },
 };
 
-// Zero heap allocations — futures are inline in the returned struct
+// Futures are inline in the returned struct
 var batch = scheduler.submitInlineBatch(PhysicsJob, 4, &jobs, .high);
 
 // awaitAll returns a stack-allocated [4]Result — also zero allocations
@@ -179,7 +196,7 @@ const results = batch.awaitAll(io);
 **Runtime-sized batch with caller-provided buffer — `submitBatchBuf`:**
 
 ```zig
-var future_buf: [64]std.Io.Future(u64) = undefined;
+var future_buf: [64]zob.Future(u64) = undefined;
 const futures = scheduler.submitBatchBuf(ComputeJob, items, .normal, &future_buf);
 
 var result_buf: [64]u64 = undefined;
@@ -204,8 +221,10 @@ const results = batch.awaitAllBuf(io, &result_buf); // no allocation for results
 |--------|:---:|:---:|------|
 | `submitBatch` + `awaitAll` | heap | heap | Dynamic sizes, convenience |
 | `submitBatch` + `awaitAllBuf` | heap | none | Dynamic batch, known max results |
-| `submitInlineBatch` + `awaitAll` | none | none | Comptime-known batch size (fastest) |
-| `submitBatchBuf` | none | manual | Full control, zero-alloc hot path |
+| `submitInlineBatch` + `awaitAll` | none* | none | Comptime-known batch size |
+| `submitBatchBuf` | none* | manual | Caller-managed futures buffer |
+
+\* Bounded schedulers allocate per queued job; the default scheduler does not.
 
 ## Benchmarks
 
@@ -257,4 +276,3 @@ zig build bench -- --work=10000              # very heavy jobs (~100us each)
 - **Fan-out / fan-in** — parallel scatter-gather pattern
 - **Game frame simulation** — mixed-priority batches (physics + AI + audio)
 - **Sustained throughput** — 10 consecutive waves of batches
-
